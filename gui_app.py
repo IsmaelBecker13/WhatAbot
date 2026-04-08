@@ -6,9 +6,14 @@ from typing import List, Dict, Optional
 import os
 import requests
 import time
-import pywhatkit as kit
+import threading
 from datetime import datetime, timedelta
-import pyautogui
+from urllib.parse import quote
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 
 class WhatsAppMensajeApp:
@@ -22,6 +27,13 @@ class WhatsAppMensajeApp:
         self.datos_excel = []
         self.archivo_cargado = ""
         self.columnas_disponibles = []
+        self.enviar_hilo = None
+        self.detener_envio = threading.Event()
+        self.pausar_envio = threading.Event()
+        self.pausar_envio.set()
+        self.ventana_progreso_envio = None
+        self.btn_enviar = None
+        self.whatsapp_driver = None
         
         # Crear interfaz
         self.crear_interfaz()
@@ -126,9 +138,9 @@ Becker Cristian"""
                                    command=self.actualizar_preview)
         btn_actualizar.pack(side=tk.LEFT, padx=5)
         
-        btn_enviar = ttk.Button(panel_inferior, text="Enviar Mensajes por WhatsApp",
-                               command=self.enviar_mensajes)
-        btn_enviar.pack(side=tk.LEFT, padx=5)
+        self.btn_enviar = ttk.Button(panel_inferior, text="Enviar Mensajes por WhatsApp",
+                          command=self.enviar_mensajes)
+        self.btn_enviar.pack(side=tk.LEFT, padx=5)
         
         # Separador visual
         ttk.Label(panel_inferior, text="  |  ").pack(side=tk.LEFT, padx=2)
@@ -361,6 +373,10 @@ Becker Cristian"""
         if not self.datos_excel:
             messagebox.showwarning("Advertencia", "Carga un archivo Excel primero")
             return
+
+        if self.enviar_hilo and self.enviar_hilo.is_alive():
+            messagebox.showinfo("Envío en curso", "Ya hay un envío en progreso.")
+            return
         
         # Confirmar
         respuesta = messagebox.askyesno(
@@ -372,11 +388,18 @@ Becker Cristian"""
         
         if not respuesta:
             return
+
+        self.detener_envio.clear()
+        self.pausar_envio.set()
+        if self.btn_enviar:
+            self.btn_enviar.config(state=tk.DISABLED)
         
         # Crear ventana de progreso
         ventana_progreso = tk.Toplevel(self.root)
         ventana_progreso.title("Enviando mensajes...")
         ventana_progreso.geometry("500x350")
+        ventana_progreso.protocol("WM_DELETE_WINDOW", self.detener_envio_envio)
+        self.ventana_progreso_envio = ventana_progreso
         
         frame_progreso = ttk.Frame(ventana_progreso, padding=10)
         frame_progreso.pack(fill=tk.BOTH, expand=True)
@@ -386,6 +409,23 @@ Becker Cristian"""
         
         ttk.Label(frame_progreso, text="(No cierres la ventana del navegador)", 
                  font=("Arial", 9, "italic"), foreground="blue").pack(anchor=tk.W)
+
+        frame_controles = ttk.Frame(frame_progreso)
+        frame_controles.pack(fill=tk.X, pady=(5, 0))
+
+        self.btn_pausar_envio = ttk.Button(
+            frame_controles,
+            text="Pausar",
+            command=self.toggle_pausa_envio
+        )
+        self.btn_pausar_envio.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.btn_detener_envio = ttk.Button(
+            frame_controles,
+            text="Terminar",
+            command=self.detener_envio_envio
+        )
+        self.btn_detener_envio.pack(side=tk.LEFT)
         
         barra_progreso = ttk.Progressbar(frame_progreso, maximum=len(self.datos_excel))
         barra_progreso.pack(fill=tk.X, pady=10)
@@ -393,80 +433,209 @@ Becker Cristian"""
         text_log = tk.Text(frame_progreso, height=14, wrap=tk.WORD)
         text_log.pack(fill=tk.BOTH, expand=True)
         
-        # Enviar mensajes
         plantilla = self.texto_plantilla.get(1.0, tk.END)
+        text_log.config(state=tk.DISABLED)
+
+        self.enviar_hilo = threading.Thread(
+            target=self._enviar_mensajes_en_segundo_plano,
+            args=(plantilla, text_log, barra_progreso),
+            daemon=True
+        )
+        self.enviar_hilo.start()
+
+    def _actualizar_log_envio(self, text_log, mensaje: str):
+        self.root.after(0, self._actualizar_log_envio_ui, text_log, mensaje)
+
+    def _actualizar_log_envio_ui(self, text_log, mensaje: str):
+        if not text_log.winfo_exists():
+            return
+        text_log.config(state=tk.NORMAL)
+        text_log.insert(tk.END, mensaje)
+        text_log.see(tk.END)
+        text_log.config(state=tk.DISABLED)
+
+    def _actualizar_progreso_envio(self, barra_progreso, valor: int):
+        def actualizar():
+            if barra_progreso.winfo_exists():
+                barra_progreso.config(value=valor)
+
+        self.root.after(0, actualizar)
+
+    def _esperar_con_control(self, segundos: float) -> bool:
+        fin = time.time() + segundos
+        while time.time() < fin:
+            if self.detener_envio.is_set():
+                return False
+            if not self.pausar_envio.wait(timeout=0.25):
+                continue
+            restante = fin - time.time()
+            if restante > 0:
+                time.sleep(min(0.5, restante))
+        return not self.detener_envio.is_set()
+
+    def _finalizar_envio_ui(self, ventana_progreso, enviados: int, errores: int, detenido: bool):
+        if ventana_progreso and ventana_progreso.winfo_exists():
+            ventana_progreso.destroy()
+
+        if self.btn_enviar:
+            self.btn_enviar.config(state=tk.NORMAL)
+
+        self.enviar_hilo = None
+        self.ventana_progreso_envio = None
+
+        if detenido:
+            self.label_estado.config(text=f"Envío detenido. Enviados: {enviados}, Errores: {errores}", foreground="orange")
+        else:
+            self.label_estado.config(
+                text=f"Enviados: {enviados}, Errores: {errores}",
+                foreground="green" if errores == 0 else "orange"
+            )
+
+    def _obtener_driver_whatsapp(self):
+        if self.whatsapp_driver:
+            return self.whatsapp_driver
+
+        try:
+            opciones = webdriver.ChromeOptions()
+            opciones.add_argument("--disable-notifications")
+            self.whatsapp_driver = webdriver.Chrome(options=opciones)
+            self.whatsapp_driver.get("https://web.whatsapp.com")
+
+            # Espera a que el usuario escanee QR si hace falta.
+            WebDriverWait(self.whatsapp_driver, 120).until(
+                EC.presence_of_element_located((By.ID, "pane-side"))
+            )
+            return self.whatsapp_driver
+        except Exception as e:
+            print(f"Error iniciando WhatsApp Web con Selenium: {e}")
+            self._cerrar_driver_whatsapp()
+            return None
+
+    def _cerrar_driver_whatsapp(self):
+        if self.whatsapp_driver:
+            try:
+                self.whatsapp_driver.quit()
+            except Exception:
+                pass
+            finally:
+                self.whatsapp_driver = None
+
+    def _enviar_mensajes_en_segundo_plano(self, plantilla: str, text_log, barra_progreso):
         enviados = 0
         errores = 0
-        
-        for i, registro in enumerate(self.datos_excel, 1):
-            try:
-                # Generar mensaje
-                mensaje = self.generar_mensaje(plantilla, registro)
-                
-                # Obtener teléfono y convertir a string
-                telefono = (registro.get('TELEFONO', '') or 
-                          registro.get('Teléfono', '') or
-                          registro.get('telefono', '') or
-                          registro.get('Celular', '') or
-                          registro.get('celular', '') or '')
-                
-                # Limpiar número de teléfono
-                telefono = self.limpiar_telefono(telefono)
-                
-                if not telefono:
-                    text_log.insert(tk.END, f"[{i}] ✗ Teléfono no encontrado\n")
+        espera_entre_mensajes = 15
+
+        try:
+            for i, registro in enumerate(self.datos_excel, 1):
+                if self.detener_envio.is_set():
+                    break
+
+                while not self.pausar_envio.is_set():
+                    if self.detener_envio.is_set():
+                        break
+                    time.sleep(0.2)
+
+                if self.detener_envio.is_set():
+                    break
+
+                try:
+                    mensaje = self.generar_mensaje(plantilla, registro)
+
+                    telefono = (registro.get('TELEFONO', '') or 
+                              registro.get('Teléfono', '') or
+                              registro.get('telefono', '') or
+                              registro.get('Celular', '') or
+                              registro.get('celular', '') or '')
+
+                    telefono = self.limpiar_telefono(telefono)
+
+                    if not telefono:
+                        self._actualizar_log_envio(text_log, f"[{i}] ✗ Teléfono no encontrado\n")
+                        errores += 1
+                        self._actualizar_progreso_envio(barra_progreso, i)
+                        continue
+
+                    if self.enviar_whatsapp_web(telefono, mensaje):
+                        self._actualizar_log_envio(text_log, f"[{i}] ✓ Enviado a {telefono}\n")
+                        enviados += 1
+                    else:
+                        self._actualizar_log_envio(text_log, f"[{i}] ✗ Error al enviar a {telefono}\n")
+                        errores += 1
+
+                    self._actualizar_progreso_envio(barra_progreso, i)
+
+                    if not self._esperar_con_control(espera_entre_mensajes):
+                        break
+
+                except Exception as e:
+                    self._actualizar_log_envio(text_log, f"[{i}] ✗ Error: {str(e)}\n")
                     errores += 1
-                    text_log.see(tk.END)
-                    ventana_progreso.update()
-                    barra_progreso['value'] = i
-                    continue
-                
-                # Enviar con pywhatkit
-                if self.enviar_whatsapp_web(telefono, mensaje):
-                    text_log.insert(tk.END, f"[{i}] ✓ Enviado a {telefono}\n")
-                    enviados += 1
-                else:
-                    text_log.insert(tk.END, f"[{i}] ✗ Error al enviar a {telefono}\n")
-                    errores += 1
-                
-                text_log.see(tk.END)
-                ventana_progreso.update()
-                barra_progreso['value'] = i
-                
-                # Ya no es necesario sleep adicional aquí porque enviar_whatsapp_web maneja el timing
-            
-            except Exception as e:
-                text_log.insert(tk.END, f"[{i}] ✗ Error: {str(e)}\n")
-                errores += 1
-                text_log.see(tk.END)
-                ventana_progreso.update()
-                barra_progreso['value'] = i
-        
-        # Resultado final
-        text_log.insert(tk.END, f"\n{'='*40}\n")
-        text_log.insert(tk.END, f"Enviados: {enviados}\n")
-        text_log.insert(tk.END, f"Errores: {errores}\n")
-        text_log.config(state=tk.DISABLED)
-        
-        self.label_estado.config(
-            text=f"Enviados: {enviados}, Errores: {errores}",
-            foreground="green" if errores == 0 else "orange"
-        )
+                    self._actualizar_progreso_envio(barra_progreso, i)
+        finally:
+            self._cerrar_driver_whatsapp()
+            self.root.after(0, self._actualizar_log_envio_ui, text_log, f"\n{'='*40}\nEnviados: {enviados}\nErrores: {errores}\n")
+            self.root.after(0, self._finalizar_envio_ui, self.ventana_progreso_envio, enviados, errores, self.detener_envio.is_set())
     
     def enviar_whatsapp_web(self, telefono: str, mensaje: str) -> bool:
-        """Enviar mensaje por WhatsApp Web usando pywhatkit"""
+        """Enviar mensaje por WhatsApp Web usando Selenium"""
         try:
-            kit.sendwhatmsg_instantly(phone_no=telefono, message=mensaje, wait_time=10)
-            # Presionar Enter para enviar el mensaje
+            driver = self._obtener_driver_whatsapp()
+            if not driver:
+                return False
+
+            telefono_limpio = telefono.replace("+", "").strip()
+            url = f"https://web.whatsapp.com/send?phone={telefono_limpio}&text={quote(mensaje)}"
+            driver.get(url)
+
+            boton_enviar = WebDriverWait(driver, 35).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//button[@data-icon='send' or @aria-label='Enviar' or @aria-label='Send']")
+                )
+            )
+
+            try:
+                boton_enviar.click()
+            except WebDriverException:
+                driver.execute_script("arguments[0].click();", boton_enviar)
+
             time.sleep(2)
-            pyautogui.press('enter')
-            # Esperar a que se envíe y se prepare para el siguiente
-            time.sleep(5)
             return True
+        except TimeoutException:
+            print(f"Timeout esperando botón Enviar para {telefono}")
+            return False
         
         except Exception as e:
-            print(f"Error enviando WhatsApp a {telefono}: {e}")
+            print(f"Error enviando WhatsApp con Selenium a {telefono}: {e}")
             return False
+
+    def toggle_pausa_envio(self):
+        """Pausar o reanudar el envío en curso"""
+        if not self.enviar_hilo or not self.enviar_hilo.is_alive():
+            return
+
+        if self.pausar_envio.is_set():
+            self.pausar_envio.clear()
+            if hasattr(self, 'btn_pausar_envio'):
+                self.btn_pausar_envio.config(text="Reanudar")
+            if self.label_estado.winfo_exists():
+                self.label_estado.config(text="Envío en pausa", foreground="blue")
+        else:
+            self.pausar_envio.set()
+            if hasattr(self, 'btn_pausar_envio'):
+                self.btn_pausar_envio.config(text="Pausar")
+            if self.label_estado.winfo_exists():
+                self.label_estado.config(text="Envío reanudado", foreground="green")
+
+    def detener_envio_envio(self):
+        """Detener el envío en curso"""
+        self.detener_envio.set()
+        self.pausar_envio.set()
+        if hasattr(self, 'btn_pausar_envio'):
+            self.btn_pausar_envio.config(state=tk.DISABLED)
+        if hasattr(self, 'btn_detener_envio'):
+            self.btn_detener_envio.config(state=tk.DISABLED)
+        if self.label_estado.winfo_exists():
+            self.label_estado.config(text="Deteniendo envío...", foreground="orange")
     
     def guardar_plantilla(self):
         """Guardar plantilla a archivo"""
